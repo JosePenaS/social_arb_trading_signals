@@ -1,15 +1,12 @@
 name: Generate Tweet Signals
 
 on:
+  # Run twice per day (≈9:00 AM & 3:30 PM New York)
   schedule:
     - cron: '0 13 * * *'
     - cron: '30 19 * * *'
-  workflow_dispatch:
-    inputs:
-      time_window_hours:
-        description: 'Lookback window in hours (default 24)'
-        required: false
-        default: '24'
+  # Allow manual runs
+  workflow_dispatch: {}
 
 concurrency:
   group: tweet-signals
@@ -41,12 +38,6 @@ jobs:
             "glue","httr","DBI","RPostgres","tidyr"
           ), repos="https://cloud.r-project.org")'
 
-      # (Optional but handy) show repo contents if it ever fails again
-      - name: Show repo tree
-        run: |
-          pwd
-          ls -la
-
       - name: Run generate_tweet_signals.R
         env:
           SUPABASE_HOST:   ${{ secrets.SUPABASE_HOST }}
@@ -55,7 +46,8 @@ jobs:
           SUPABASE_USER:   ${{ secrets.SUPABASE_USER }}
           SUPABASE_PWD:    ${{ secrets.SUPABASE_PWD }}
           OPENAI_API_KEY:  ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL:    ${{ vars.OPENAI_MODEL }}
-          TIME_WINDOW_HOURS: ${{ inputs.time_window_hours || vars.TIME_WINDOW_HOURS || '24' }}
+          OPENAI_MODEL:    ${{ vars.OPENAI_MODEL || 'gpt-4o' }}
+          BATCH_LIMIT:     ${{ vars.BATCH_LIMIT || '150' }}
         run: |
           Rscript generate_tweet_signals.R
+
