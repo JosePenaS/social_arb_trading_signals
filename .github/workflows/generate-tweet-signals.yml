@@ -1,0 +1,68 @@
+name: Generate Tweet Signals
+
+on:
+  # Run twice per day
+  schedule:
+    # ~9:00 AM New York (13:00 UTC during DST, 14:00 UTC in winter)
+    - cron: '0 13 * * *'
+    # ~3:30 PM New York (19:30 UTC during DST, 20:30 UTC in winter)
+    - cron: '30 19 * * *'
+  # Manual trigger with optional overrides
+  workflow_dispatch:
+    inputs:
+      time_window_hours:
+        description: 'Lookback window in hours (default 24)'
+        required: false
+        default: '24'
+
+# Avoid overlapping runs
+concurrency:
+  group: tweet-signals
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      # 1) Checkout repo
+      - uses: actions/checkout@v4
+
+      # 2) Install R
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: '4.3'
+
+      # 3) System libraries for RPostgres/httr/etc.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libpq-dev libssl-dev \
+            libcurl4-openssl-dev libxml2-dev
+
+      # 4) Install CRAN packages used by the script
+      - name: Install R packages
+        run: |
+          Rscript -e 'install.packages(c(
+            "dplyr","purrr","stringr","lubridate","jsonlite",
+            "glue","httr","DBI","RPostgres","tidyr"
+          ), repos="https://cloud.r-project.org")'
+
+      # 5) Run the script
+      - name: Run generate_tweet_signals.R
+        env:
+          # ---- Supabase / Postgres ----
+          SUPABASE_HOST:   ${{ secrets.SUPABASE_HOST }}
+          SUPABASE_PORT:   ${{ secrets.SUPABASE_PORT }}
+          SUPABASE_DB:     ${{ secrets.SUPABASE_DB }}
+          SUPABASE_USER:   ${{ secrets.SUPABASE_USER }}
+          SUPABASE_PWD:    ${{ secrets.SUPABASE_PWD }}
+          # ---- OpenAI ----
+          OPENAI_API_KEY:  ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL:    ${{ vars.OPENAI_MODEL }}
+          # ---- Window (hours) ----
+          TIME_WINDOW_HOURS: ${{ inputs.time_window_hours || vars.TIME_WINDOW_HOURS || '24' }}
+        run: |
+          Rscript scripts/generate_tweet_signals.R
