@@ -16,7 +16,7 @@ suppressPackageStartupMessages({
 # -------------------------- Config ------------------------------
 
 OPENAI_MODEL  <- Sys.getenv("OPENAI_MODEL", "gpt-4o")
-BATCH_LIMIT   <- as.integer(Sys.getenv("BATCH_LIMIT", "150"))  # max new threads per run
+BATCH_LIMIT   <- as.integer(Sys.getenv("BATCH_LIMIT", "1500"))  # max new threads per run
 
 PG_HOST <- Sys.getenv("SUPABASE_HOST")
 PG_PORT <- as.integer(Sys.getenv("SUPABASE_PORT", "5432"))
@@ -427,3 +427,4 @@ dbExecute(con, sprintf("
 dbExecute(con, sprintf("DROP TABLE IF EXISTS %s;", DBI::dbQuoteIdentifier(con, tmp_name)))
 
 message(sprintf("✅ Upserted %d signals from %d unseen threads.", nrow(signals_db), nrow(df)))
+
