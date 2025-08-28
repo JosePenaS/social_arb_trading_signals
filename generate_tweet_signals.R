@@ -16,7 +16,7 @@ suppressPackageStartupMessages({
 # -------------------------- Config ------------------------------
 
 OPENAI_MODEL  <- Sys.getenv("OPENAI_MODEL", "gpt-4o")
-BATCH_LIMIT   <- as.integer(Sys.getenv("BATCH_LIMIT", "1500"))  # max new threads per run
+BATCH_LIMIT   <- as.integer(Sys.getenv("BATCH_LIMIT", "150"))  # max new threads per run
 
 PG_HOST <- Sys.getenv("SUPABASE_HOST")
 PG_PORT <- as.integer(Sys.getenv("SUPABASE_PORT", "5432"))
@@ -41,7 +41,7 @@ con <- dbConnect(
 on.exit(try(dbDisconnect(con), silent = TRUE))
 
 # Ensure target table exists so the anti-join query works on first run
-dbExecute(con, "
+invisible(dbExecute(con, "
   CREATE TABLE IF NOT EXISTS tweet_signals (
     tweet_key         text PRIMARY KEY,
     username          text,
@@ -62,7 +62,7 @@ dbExecute(con, "
     evidence_types    text,
     evidence_snippet  text
   );
-")
+"))
 
 # -------------------------- Pull ONLY unseen threads ------------
 
@@ -233,38 +233,74 @@ df <- df %>%
     })
   )
 
-# -------------------------- Parse JSON --------------------------
+# -------------------------- Safe JSON parse ---------------------
+
+# typed 0-row tibble with all expected columns
+empty_signals <- tibble::as_tibble(expected_schema)[0, ]
+
+# helper to coerce missing columns to the expected types
+.fill_missing_cols <- function(out, expected_schema) {
+  miss <- setdiff(names(expected_schema), names(out))
+  if (!length(miss)) return(out)
+  for (nm in miss) {
+    tmpl <- expected_schema[[nm]]
+    if ("numeric" %in% class(tmpl))   out[[nm]] <- rep(as.numeric(NA),  nrow(out))
+    else if ("integer" %in% class(tmpl))  out[[nm]] <- rep(as.integer(NA),  nrow(out))
+    else if ("logical" %in% class(tmpl))  out[[nm]] <- rep(as.logical(NA),  nrow(out))
+    else out[[nm]] <- rep(as.character(NA), nrow(out))
+  }
+  out
+}
+
+parse_signals_one <- function(txt, cid) {
+  if (is.na(txt) || txt == "") {
+    message("🧹 ", cid, " empty GPT reply")
+    return(empty_signals)
+  }
+
+  out <- tryCatch(
+    jsonlite::fromJSON(txt)$signals,
+    error = function(e) {
+      message("🧹 ", cid, " JSON parse error")
+      NULL
+    }
+  )
+
+  if (is.null(out) || length(out) == 0) {
+    return(empty_signals)
+  }
+
+  out <- tibble::as_tibble(out)
+  out <- .fill_missing_cols(out, expected_schema)
+
+  out %>%
+    mutate(
+      conviction        = pmin(pmax(as.numeric(conviction), 0), 1),
+      stop_loss_pct     = as.integer(stop_loss_pct),
+      sentiment_score   = as.numeric(sentiment_score),
+      buy_zone          = as.logical(buy_zone),
+      direction         = as.character(direction),
+      horizon           = as.character(horizon),
+      rationale         = map_chr(rationale, ~ paste(as.character(.x), collapse = " ")),
+      specificity_score = pmin(pmax(as.numeric(specificity_score), 0), 1),
+      has_quant_data    = as.logical(has_quant_data),
+      evidence_score    = pmin(pmax(as.numeric(evidence_score), 0), 1),
+      evidence_types    = as.character(evidence_types %||% ""),
+      evidence_snippet  = as.character(evidence_snippet %||% "")
+    )
+}
 
 df <- df %>%
   mutate(
-    gpt_table = map2(gpt_raw, conversation_id, function(txt, cid) {
-      if (is.na(txt) || txt == "") { message("🧹 ", cid, " empty GPT reply"); return(tibble()) }
-      out <- tryCatch(jsonlite::fromJSON(txt)$signals %>% tibble::as_tibble(),
-                      error = function(e) { message("🧹 ", cid, " JSON parse error"); tibble() })
-      if (nrow(out) == 0) return(out)
-
-      missing <- setdiff(names(expected_schema), names(out))
-      if (length(missing)) for (nm in missing) {
-        tmpl <- expected_schema[[nm]]; out[[nm]] <- rep(NA, nrow(out)) |> as(class(tmpl)[1])
-      }
-
-      out %>%
-        mutate(
-          conviction        = pmin(pmax(as.numeric(conviction), 0), 1),
-          stop_loss_pct     = as.integer(stop_loss_pct),
-          sentiment_score   = as.numeric(sentiment_score),
-          buy_zone          = as.logical(buy_zone),
-          direction         = as.character(direction),
-          horizon           = as.character(horizon),
-          rationale         = map_chr(rationale, ~ paste(as.character(.x), collapse = " ")),
-          specificity_score = pmin(pmax(as.numeric(specificity_score), 0), 1),
-          has_quant_data    = as.logical(has_quant_data),
-          evidence_score    = pmin(pmax(as.numeric(evidence_score), 0), 1),
-          evidence_types    = as.character(evidence_types %||% ""),
-          evidence_snippet  = as.character(evidence_snippet %||% "")
-        )
-    })
+    gpt_table = map2(gpt_raw, conversation_id, parse_signals_one)
   )
+
+# Optional telemetry
+ideas_per_thread <- purrr::map_int(df$gpt_table, nrow)
+message(sprintf(
+  "📊 threads=%d | threads_with_ideas=%d | total_ideas=%d",
+  nrow(df), sum(ideas_per_thread > 0), sum(ideas_per_thread)
+))
 
 # -------------------------- Ticker normalization ----------------
 
@@ -325,7 +361,7 @@ fix_ticker <- function(sym_vec) vapply(sym_vec, .fix_one, character(1))
 
 signals_from_tweets <- df %>%
   select(username, conversation_id, created_et, text, gpt_table) %>%
-  unnest(gpt_table) %>%
+  tidyr::unnest(gpt_table, keep_empty = TRUE) %>%   # keep typed empties safely
   filter(!is.na(ticker)) %>%
   mutate(ticker = fix_ticker(ticker)) %>%
   filter(!is.na(ticker))
@@ -391,7 +427,7 @@ signals_db <- signals_from_tweets %>%
 tmp_name <- "tmp_tweet_signals"
 dbWriteTable(con, tmp_name, signals_db, temporary = TRUE, overwrite = TRUE)
 
-dbExecute(con, sprintf("
+invisible(dbExecute(con, sprintf("
   INSERT INTO tweet_signals AS t (
     tweet_key, username, conversation_id, created_et, text, ticker,
     conviction, direction, horizon, stop_loss_pct, buy_zone,
@@ -422,9 +458,9 @@ dbExecute(con, sprintf("
     evidence_score    = EXCLUDED.evidence_score,
     evidence_types    = EXCLUDED.evidence_types,
     evidence_snippet  = EXCLUDED.evidence_snippet;
-", DBI::dbQuoteIdentifier(con, tmp_name)))
+", DBI::dbQuoteIdentifier(con, tmp_name))))
 
-dbExecute(con, sprintf("DROP TABLE IF EXISTS %s;", DBI::dbQuoteIdentifier(con, tmp_name)))
+invisible(dbExecute(con, sprintf("DROP TABLE IF EXISTS %s;", DBI::dbQuoteIdentifier(con, tmp_name))))
 
 message(sprintf("✅ Upserted %d signals from %d unseen threads.", nrow(signals_db), nrow(df)))
 
