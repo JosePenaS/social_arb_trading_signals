@@ -427,5 +427,3 @@ dbExecute(con, sprintf("
 dbExecute(con, sprintf("DROP TABLE IF EXISTS %s;", DBI::dbQuoteIdentifier(con, tmp_name)))
 
 message(sprintf("✅ Upserted %d signals from %d unseen threads.", nrow(signals_db), nrow(df)))
-
-
