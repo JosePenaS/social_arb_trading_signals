@@ -40,14 +40,25 @@ jobs:
 
       - name: Run generate_tweet_signals.R
         env:
+          # ---- Supabase ----
           SUPABASE_HOST:   ${{ secrets.SUPABASE_HOST }}
           SUPABASE_PORT:   ${{ secrets.SUPABASE_PORT }}
           SUPABASE_DB:     ${{ secrets.SUPABASE_DB }}
           SUPABASE_USER:   ${{ secrets.SUPABASE_USER }}
           SUPABASE_PWD:    ${{ secrets.SUPABASE_PWD }}
+
+          # ---- OpenAI ----
           OPENAI_API_KEY:  ${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL:    ${{ vars.OPENAI_MODEL || 'gpt-4o' }}
+
+          # ---- Controls (24h window version) ----
+          TIME_WINDOW_HOURS: ${{ vars.TIME_WINDOW_HOURS || '24' }}
+          SPEC_MIN:          ${{ vars.SPEC_MIN || '0.30' }}
+
+          # Kept for compatibility if you switch back to unseen-threads mode
           BATCH_LIMIT:     ${{ vars.BATCH_LIMIT || '150' }}
         run: |
           Rscript generate_tweet_signals.R
+          # If your script lives in scripts/, use:
+          # Rscript scripts/generate_tweet_signals.R
 
