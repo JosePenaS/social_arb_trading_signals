@@ -15,7 +15,7 @@ suppressPackageStartupMessages({
 
 # -------------------------- Config ------------------------------
 
-TIME_WINDOW_HOURS <- as.integer(Sys.getenv("TIME_WINDOW_HOURS", "24"))
+TIME_WINDOW_HOURS <- as.integer(Sys.getenv("TIME_WINDOW_HOURS", "168"))
 OPENAI_MODEL      <- Sys.getenv("OPENAI_MODEL", "gpt-4o")
 SPEC_MIN          <- as.numeric(Sys.getenv("SPEC_MIN", "0.15")) # keep/tune in R
 
@@ -437,4 +437,5 @@ invisible(dbExecute(con, sprintf("
 invisible(dbExecute(con, sprintf("DROP TABLE IF EXISTS %s;", DBI::dbQuoteIdentifier(con, tmp_name))))
 
 message(sprintf("✅ Upserted %d signals from the last %d hours.", nrow(signals_db), TIME_WINDOW_HOURS))
+
 
