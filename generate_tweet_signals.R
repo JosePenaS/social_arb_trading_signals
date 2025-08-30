@@ -1,7 +1,7 @@
 #!/usr/bin/env Rscript
 
 # ================================================================
-# Generate trade signals ONLY for threads not yet in tweet_signals
+# Generate trade signals from the last N hours of twitter_threads
 # and upsert into Supabase (tweet_signals)
 # ================================================================
 
@@ -15,8 +15,9 @@ suppressPackageStartupMessages({
 
 # -------------------------- Config ------------------------------
 
-OPENAI_MODEL  <- Sys.getenv("OPENAI_MODEL", "gpt-4o")
-BATCH_LIMIT   <- as.integer(Sys.getenv("BATCH_LIMIT", "150"))  # max new threads per run
+TIME_WINDOW_HOURS <- as.integer(Sys.getenv("TIME_WINDOW_HOURS", "24"))
+OPENAI_MODEL      <- Sys.getenv("OPENAI_MODEL", "gpt-4o")
+SPEC_MIN          <- as.numeric(Sys.getenv("SPEC_MIN", "0.15")) # keep/tune in R
 
 PG_HOST <- Sys.getenv("SUPABASE_HOST")
 PG_PORT <- as.integer(Sys.getenv("SUPABASE_PORT", "5432"))
@@ -40,7 +41,7 @@ con <- dbConnect(
 )
 on.exit(try(dbDisconnect(con), silent = TRUE))
 
-# Ensure target table exists so the anti-join query works on first run
+# Ensure target table exists
 invisible(dbExecute(con, "
   CREATE TABLE IF NOT EXISTS tweet_signals (
     tweet_key         text PRIMARY KEY,
@@ -64,29 +65,24 @@ invisible(dbExecute(con, "
   );
 "))
 
-# -------------------------- Pull ONLY unseen threads ------------
+# -------------------------- Pull last N hours -------------------
 
 qry <- sprintf("
-  WITH seen AS (
-    SELECT DISTINCT conversation_id FROM tweet_signals
-  )
-  SELECT t.conversation_id, t.username, t.created, t.text
-  FROM twitter_threads t
-  LEFT JOIN seen s USING (conversation_id)
-  WHERE s.conversation_id IS NULL
-  ORDER BY t.created ASC
-  LIMIT %d;
-", BATCH_LIMIT)
+  SELECT conversation_id, username, created, text
+  FROM twitter_threads
+  WHERE created >= now() - interval '%d hours'
+  ORDER BY created ASC;
+", TIME_WINDOW_HOURS)
 
-collapsed_tbl <- dbGetQuery(con, qry)
+threads <- dbGetQuery(con, qry)
 
-if (nrow(collapsed_tbl) == 0) {
-  message("No unseen threads to process. Exiting.")
+if (nrow(threads) == 0) {
+  message(sprintf("No threads found in the last %d hours. Exiting.", TIME_WINDOW_HOURS))
   quit(status = 0)
 }
 
 # Normalize timezones (keep ET column)
-tbl_et <- collapsed_tbl %>%
+tbl_et <- threads %>%
   mutate(
     created_utc = with_tz(as_datetime(created), tzone = "UTC"),
     created_et  = with_tz(created_utc, tzone = "America/New_York")
@@ -202,7 +198,7 @@ TASK
    - 0.5–0.7: some numbers or specific sources
    - 0.8–1.0: multiple verifiable figures/sources or high-quality data
 
-6) If an idea is too weak (no ticker OR specificity_score < 0.30) DROP it.
+6) Keep weak ideas as long as a ticker is present. Only drop ideas with NO ticker.
    If no valid ideas remain, return {{\"signals\": []}}.
 
 7) Enforce all ranges by scaling/rounding/clipping. DO NOT include extra keys.
@@ -223,31 +219,31 @@ df <- tbl_et %>%
   select(conversation_id, created_et, text, username) %>%
   mutate(prompt = map_chr(text, make_tweet_prompt))
 
-message(sprintf("Processing %d unseen threads (limit %d)…", nrow(df), BATCH_LIMIT))
+message(sprintf("Processing %d threads from last %d hours…", nrow(df), TIME_WINDOW_HOURS))
 
 df <- df %>%
   mutate(
     gpt_raw = map2_chr(prompt, seq_len(n()), function(pr, i) {
       if (i %% 10 == 0 || i == 1) message(sprintf("  • GPT %d / %d", i, nrow(df)))
-      safe_ask(pr)
+      res <- safe_ask(pr)
+      if (i %% 20 == 0) Sys.sleep(1.0)  # gentle rate limit
+      res
     })
   )
 
 # -------------------------- Safe JSON parse ---------------------
 
-# typed 0-row tibble with all expected columns
 empty_signals <- tibble::as_tibble(expected_schema)[0, ]
 
-# helper to coerce missing columns to the expected types
 .fill_missing_cols <- function(out, expected_schema) {
   miss <- setdiff(names(expected_schema), names(out))
   if (!length(miss)) return(out)
   for (nm in miss) {
     tmpl <- expected_schema[[nm]]
-    if ("numeric" %in% class(tmpl))   out[[nm]] <- rep(as.numeric(NA),  nrow(out))
-    else if ("integer" %in% class(tmpl))  out[[nm]] <- rep(as.integer(NA),  nrow(out))
-    else if ("logical" %in% class(tmpl))  out[[nm]] <- rep(as.logical(NA),  nrow(out))
-    else out[[nm]] <- rep(as.character(NA), nrow(out))
+    if ("numeric" %in% class(tmpl))      out[[nm]] <- rep(as.numeric(NA),  nrow(out))
+    else if ("integer" %in% class(tmpl)) out[[nm]] <- rep(as.integer(NA),  nrow(out))
+    else if ("logical" %in% class(tmpl)) out[[nm]] <- rep(as.logical(NA),  nrow(out))
+    else                                 out[[nm]] <- rep(as.character(NA), nrow(out))
   }
   out
 }
@@ -257,18 +253,9 @@ parse_signals_one <- function(txt, cid) {
     message("🧹 ", cid, " empty GPT reply")
     return(empty_signals)
   }
-
-  out <- tryCatch(
-    jsonlite::fromJSON(txt)$signals,
-    error = function(e) {
-      message("🧹 ", cid, " JSON parse error")
-      NULL
-    }
-  )
-
-  if (is.null(out) || length(out) == 0) {
-    return(empty_signals)
-  }
+  out <- tryCatch(jsonlite::fromJSON(txt)$signals,
+                  error = function(e) { message("🧹 ", cid, " JSON parse error"); NULL })
+  if (is.null(out) || length(out) == 0) return(empty_signals)
 
   out <- tibble::as_tibble(out)
   out <- .fill_missing_cols(out, expected_schema)
@@ -290,17 +277,12 @@ parse_signals_one <- function(txt, cid) {
     )
 }
 
-df <- df %>%
-  mutate(
-    gpt_table = map2(gpt_raw, conversation_id, parse_signals_one)
-  )
+df <- df %>% mutate(gpt_table = map2(gpt_raw, conversation_id, parse_signals_one))
 
-# Optional telemetry
+# Telemetry
 ideas_per_thread <- purrr::map_int(df$gpt_table, nrow)
-message(sprintf(
-  "📊 threads=%d | threads_with_ideas=%d | total_ideas=%d",
-  nrow(df), sum(ideas_per_thread > 0), sum(ideas_per_thread)
-))
+message(sprintf("📊 threads=%d | with_ideas=%d | total_ideas=%d",
+                nrow(df), sum(ideas_per_thread > 0), sum(ideas_per_thread)))
 
 # -------------------------- Ticker normalization ----------------
 
@@ -310,28 +292,23 @@ message(sprintf(
     CROCS="CROX", TDMX="TMDX", ATZ="ATZ.TO", PUMA="PUM.DE",
     HUGO="BOSS.DE", PORTL="PRPL", LNMD="LNMD3.SA", DGHI="DGHI.V",
     NEWS="NWSA", ASICS="7936.T", KRKN="KRAKEN.V", GPS="GPS",
-    SHARKNINJA="SN", CELSIUS="CELH", RENK="R5RK.DE",
-    ARITZIA="ATZ.TO", `KRX:278470`="278470.KS", CAPCOM="9697.T",
-    LVMH="MC.PA", DIAGEO="DEO", LILY="LLY", BUILD="BLDR",
-    AIRLINES="JETS", TSMC="TSM", GENR="GNRC", POP="9992.HK", ZYN="PM",
-    `2501.TSE`="2501.T", `8050`="8050.T", `973.XHKG`="0973.HK",
-    ADS="ADS.DE", `ADS.GY`="ADS.DE", ADYRY="ASBRF", BRBY="BRBY.L",
-    NTODY="NTDOY", `278470`="278470.KS", `018290`="018260.KS",
-    LGHNH="003550.KS", `LGHNH.KS`="003550.KS", `EL.F`="EL.PA",
-    DOCK="DOCK.L", `FOI-B`="FOI-B.ST", GAW="GAW.L", OIL="USO",
-    SP500="^GSPC", NASDAQ="^IXIC", BTC.X="BTC-USD", FB="META",
-    GGPI="PSNY", GIK="NVVE", LAC="LAC", HEAR="HEAR",
-    MODN="MODN", MPL="MPL.AX", MTTR="MTTR", NEWR="NEWR",
-    NIBE="NIBE-B.ST", NVEI="NVEI.TO", NOVO="NVO", OZON="OZON",
-    OSTK="OSTK", PDYPY="PDYPY", PLNHF="PLNHF", PYCR="PYCR",
-    QNT="QNT.L", SAVE="SAVE", SKL="SKIL", SMAR="SMAR",
-    SNROY="SNROF", SQ="SQ", SQSP="SQSP", TPX="TPX", TRTN="TRTN",
+    SHARKNINJA="SN", CELSIUS="CELH", RENK="R5RK.DE", ARITZIA="ATZ.TO",
+    `KRX:278470`="278470.KS", CAPCOM="9697.T", LVMH="MC.PA", DIAGEO="DEO",
+    LILY="LLY", BUILD="BLDR", AIRLINES="JETS", TSMC="TSM", GENR="GNRC",
+    POP="9992.HK", ZYN="PM", `2501.TSE`="2501.T", `8050`="8050.T",
+    `973.XHKG`="0973.HK", ADS="ADS.DE", `ADS.GY`="ADS.DE", ADYRY="ASBRF",
+    BRBY="BRBY.L", NTODY="NTDOY", `278470`="278470.KS", `018290`="018260.KS",
+    LGHNH="003550.KS", `LGHNH.KS`="003550.KS", `EL.F`="EL.PA", DOCK="DOCK.L",
+    `FOI-B`="FOI-B.ST", GAW="GAW.L", OIL="USO", SP500="^GSPC", NASDAQ="^IXIC",
+    BTC.X="BTC-USD", FB="META", GGPI="PSNY", GIK="NVVE", LAC="LAC", HEAR="HEAR",
+    MODN="MODN", MPL="MPL.AX", MTTR="MTTR", NEWR="NEWR", NIBE="NIBE-B.ST",
+    NVEI="NVEI.TO", NOVO="NVO", OZON="OZON", OSTK="OSTK", PDYPY="PDYPY",
+    PLNHF="PLNHF", PYCR="PYCR", QNT="QNT.L", SAVE="SAVE", SKL="SKIL",
+    SMAR="SMAR", SNROY="SNROF", SQ="SQ", SQSP="SQSP", TPX="TPX", TRTN="TRTN",
     TTCF="TTCF", TWOU="TWOU", TWTR="TWTR", VSTO="VSTO", VVNT="VVNT",
-    WIRE="WIRE", WOSG="WOSG.L", WWE="TKO", YY="YY", ZEV="ZEV",
-    `Z1P.AX`="ZIP.AX"
+    WIRE="WIRE", WOSG="WOSG.L", WWE="TKO", YY="YY", ZEV="ZEV", `Z1P.AX`="ZIP.AX"
   )
   if (sym %in% names(stock_map)) return(unname(stock_map[sym]))
-
   crypto_keep <- c(
     "BTC","ETH","ADA","DOGE","DOT","AVAX","LINK","MANA","1INCH","AAVE","APE","ARB","ALGO",
     "MASK","METIS","MILK","MUTE","MYRO","NEXO","NFT","NFTX","OKB","OCEAN","OXT","PEPE","PYR",
@@ -345,29 +322,28 @@ message(sprintf(
     "XEM","XLM","XMR","XPR","XRD","XRP","XVG","XYO","ZANO","ZEC","ZEN"
   )
   if (sym %in% crypto_keep) return(paste0(sym, "-USD"))
-
   skip_syms <- c(
-    "SOCIALARB","SOLAMA","TOKEN","TICKERPLUS","TIPRANKS","TRUMP","TTRENDS",
-    "TRENDS","NETVR","PWEASE","PUBLIC","HOUSEHACK","FIGMA","FIGM","FIGR",
-    "FIGUREAI","FIGURE.AI","APPTRONIK","SANCTUARY.AI","OPENSEA","MRBEAST",
-    "KLAR","KLARNA","BOOPBAKERYCO","BOBO","BAYC","SHIPPING","VARDASPACE",
-    "TEMU","TES","TULAV","WLD"
+    "SOCIALARB","SOLAMA","TOKEN","TICKERPLUS","TIPRANKS","TRUMP","TTRENDS","TRENDS",
+    "NETVR","PWEASE","PUBLIC","HOUSEHACK","FIGMA","FIGM","FIGR","FIGUREAI","FIGURE.AI",
+    "APPTRONIK","SANCTUARY.AI","OPENSEA","MRBEAST","KLAR","KLARNA","BOOPBAKERYCO","BOBO",
+    "BAYC","SHIPPING","VARDASPACE","TEMU","TES","TULAV","WLD"
   )
   if (sym %in% skip_syms) return(NA_character_)
-
   sym
 }
 fix_ticker <- function(sym_vec) vapply(sym_vec, .fix_one, character(1))
 
 signals_from_tweets <- df %>%
   select(username, conversation_id, created_et, text, gpt_table) %>%
-  tidyr::unnest(gpt_table, keep_empty = TRUE) %>%   # keep typed empties safely
+  tidyr::unnest(gpt_table, keep_empty = TRUE) %>%
   filter(!is.na(ticker)) %>%
   mutate(ticker = fix_ticker(ticker)) %>%
-  filter(!is.na(ticker))
+  filter(!is.na(ticker)) %>%
+  # tune quality threshold in R (instead of hard-dropping in prompt)
+  filter(!is.na(specificity_score) & specificity_score >= SPEC_MIN)
 
 if (nrow(signals_from_tweets) == 0) {
-  message("No valid signals produced from GPT for unseen threads. Exiting.")
+  message("No valid signals produced from GPT in the selected window. Exiting.")
   quit(status = 0)
 }
 
@@ -391,7 +367,7 @@ signals_from_tweets <- signals_from_tweets %>%
   ) %>%
   distinct(conversation_id, ticker, created_et, .keep_all = TRUE)
 
-# -------------------------- Prepare for upsert ------------------
+# -------------------------- Prepare & upsert --------------------
 
 signals_db <- signals_from_tweets %>%
   mutate(
@@ -421,8 +397,6 @@ signals_db <- signals_from_tweets %>%
     evidence_types,
     evidence_snippet
   )
-
-# -------------------------- Upsert ------------------------------
 
 tmp_name <- "tmp_tweet_signals"
 dbWriteTable(con, tmp_name, signals_db, temporary = TRUE, overwrite = TRUE)
@@ -462,5 +436,5 @@ invisible(dbExecute(con, sprintf("
 
 invisible(dbExecute(con, sprintf("DROP TABLE IF EXISTS %s;", DBI::dbQuoteIdentifier(con, tmp_name))))
 
-message(sprintf("✅ Upserted %d signals from %d unseen threads.", nrow(signals_db), nrow(df)))
+message(sprintf("✅ Upserted %d signals from the last %d hours.", nrow(signals_db), TIME_WINDOW_HOURS))
 
