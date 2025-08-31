@@ -52,7 +52,7 @@ jobs:
           OPENAI_MODEL:    ${{ vars.OPENAI_MODEL || 'gpt-4o' }}
 
           # ---- Controls (24h window version) ----
-          TIME_WINDOW_HOURS: ${{ vars.TIME_WINDOW_HOURS || '168' }}
+          TIME_WINDOW_HOURS: ${{ vars.TIME_WINDOW_HOURS || '24' }}
           SPEC_MIN:          ${{ vars.SPEC_MIN || '0.30' }}
 
           # Kept for compatibility if you switch back to unseen-threads mode
