@@ -439,3 +439,4 @@ invisible(dbExecute(con, sprintf("DROP TABLE IF EXISTS %s;", DBI::dbQuoteIdentif
 message(sprintf("✅ Upserted %d signals from the last %d hours.", nrow(signals_db), TIME_WINDOW_HOURS))
 
 
+
