@@ -15,7 +15,7 @@ suppressPackageStartupMessages({
 `%||%` <- function(x, y) if (is.null(x)) y else x
 
 # -------------------------- Config ------------------------------
-TIME_WINDOW_HOURS <- as.integer(Sys.getenv("TIME_WINDOW_HOURS", "168"))
+TIME_WINDOW_HOURS <- as.integer(Sys.getenv("TIME_WINDOW_HOURS", "24"))
 OPENAI_MODEL      <- Sys.getenv("OPENAI_MODEL", "gpt-4o")
 SPEC_MIN          <- as.numeric(Sys.getenv("SPEC_MIN", "0.30"))
 
@@ -445,4 +445,5 @@ upsert_signals <- function(df) {
 upsert_signals(signals_db)
 
 message(sprintf("✅ Upserted %d signals from the last %d hours.", nrow(signals_db), TIME_WINDOW_HOURS))
+
 
