@@ -1,8 +1,9 @@
 #!/usr/bin/env Rscript
 
 # ================================================================
-# Generate trade signals from the last N hours of twitter_threads
-# and upsert into Supabase (tweet_signals)
+# Generate trade signals for the last N hours of twitter_threads
+# and upsert into Supabase (tweet_signals).
+# Opens DB only when needed to avoid idle disconnects.
 # ================================================================
 
 suppressPackageStartupMessages({
@@ -14,10 +15,9 @@ suppressPackageStartupMessages({
 `%||%` <- function(x, y) if (is.null(x)) y else x
 
 # -------------------------- Config ------------------------------
-
 TIME_WINDOW_HOURS <- as.integer(Sys.getenv("TIME_WINDOW_HOURS", "168"))
 OPENAI_MODEL      <- Sys.getenv("OPENAI_MODEL", "gpt-4o")
-SPEC_MIN          <- as.numeric(Sys.getenv("SPEC_MIN", "0.15")) # keep/tune in R
+SPEC_MIN          <- as.numeric(Sys.getenv("SPEC_MIN", "0.30"))
 
 PG_HOST <- Sys.getenv("SUPABASE_HOST")
 PG_PORT <- as.integer(Sys.getenv("SUPABASE_PORT", "5432"))
@@ -32,16 +32,18 @@ if (Sys.getenv("OPENAI_API_KEY") == "") {
   stop("OPENAI_API_KEY env var is missing.")
 }
 
-# -------------------------- DB connect --------------------------
+open_con <- function() {
+  dbConnect(
+    RPostgres::Postgres(),
+    host = PG_HOST, port = PG_PORT, dbname = PG_DB,
+    user = PG_USER, password = PG_PWD, sslmode = "require"
+  )
+}
 
-con <- dbConnect(
-  RPostgres::Postgres(),
-  host = PG_HOST, port = PG_PORT, dbname = PG_DB,
-  user = PG_USER, password = PG_PWD, sslmode = "require"
-)
-on.exit(try(dbDisconnect(con), silent = TRUE))
+# -------------------------- Ensure table & read ------------------
+# Short connection just to ensure the target table and fetch threads.
+con <- open_con()
 
-# Ensure target table exists
 invisible(dbExecute(con, "
   CREATE TABLE IF NOT EXISTS tweet_signals (
     tweet_key         text PRIMARY KEY,
@@ -65,8 +67,6 @@ invisible(dbExecute(con, "
   );
 "))
 
-# -------------------------- Pull last N hours -------------------
-
 qry <- sprintf("
   SELECT conversation_id, username, created, text
   FROM twitter_threads
@@ -75,6 +75,7 @@ qry <- sprintf("
 ", TIME_WINDOW_HOURS)
 
 threads <- dbGetQuery(con, qry)
+dbDisconnect(con)
 
 if (nrow(threads) == 0) {
   message(sprintf("No threads found in the last %d hours. Exiting.", TIME_WINDOW_HOURS))
@@ -90,7 +91,6 @@ tbl_et <- threads %>%
   select(conversation_id, username, text, created_et)
 
 # -------------------------- OpenAI helpers ----------------------
-
 expected_schema <- tibble::tibble(
   ticker            = character(),
   conviction        = numeric(),
@@ -118,8 +118,7 @@ ask_gpt <- function(prompt,
       RETRY(
         "POST",
         url = "https://api.openai.com/v1/chat/completions",
-        times     = 3,
-        pause_min = 2, pause_cap = 8,
+        times     = 3, pause_min = 2, pause_cap = 8,
         add_headers(Authorization = paste("Bearer", Sys.getenv("OPENAI_API_KEY"))),
         content_type_json(), encode = "json",
         body = list(
@@ -136,12 +135,12 @@ ask_gpt <- function(prompt,
       ),
       error = identity
     )
-    if (inherits(resp, "error")) {
-      message("HTTP error: ", resp$message)
-    } else {
+    if (!inherits(resp, "error")) {
       parsed <- content(resp, as = "parsed", simplifyVector = FALSE)
       if (!is.null(parsed$error)) return(paste0("[OPENAI-ERROR] ", parsed$error$message))
       if (length(parsed$choices) > 0) return(str_trim(parsed$choices[[1]]$message$content))
+    } else {
+      message("HTTP error: ", resp$message)
     }
     Sys.sleep(2^k)
   }
@@ -214,7 +213,6 @@ safe_ask <- purrr::possibly(
 )
 
 # -------------------------- Build prompts & call GPT ------------
-
 df <- tbl_et %>%
   select(conversation_id, created_et, text, username) %>%
   mutate(prompt = map_chr(text, make_tweet_prompt))
@@ -232,7 +230,6 @@ df <- df %>%
   )
 
 # -------------------------- Safe JSON parse ---------------------
-
 empty_signals <- tibble::as_tibble(expected_schema)[0, ]
 
 .fill_missing_cols <- function(out, expected_schema) {
@@ -279,13 +276,11 @@ parse_signals_one <- function(txt, cid) {
 
 df <- df %>% mutate(gpt_table = map2(gpt_raw, conversation_id, parse_signals_one))
 
-# Telemetry
 ideas_per_thread <- purrr::map_int(df$gpt_table, nrow)
 message(sprintf("📊 threads=%d | with_ideas=%d | total_ideas=%d",
                 nrow(df), sum(ideas_per_thread > 0), sum(ideas_per_thread)))
 
 # -------------------------- Ticker normalization ----------------
-
 .fix_one <- function(sym) {
   sym <- str_to_upper(sym)
   stock_map <- c(
@@ -339,7 +334,6 @@ signals_from_tweets <- df %>%
   filter(!is.na(ticker)) %>%
   mutate(ticker = fix_ticker(ticker)) %>%
   filter(!is.na(ticker)) %>%
-  # tune quality threshold in R (instead of hard-dropping in prompt)
   filter(!is.na(specificity_score) & specificity_score >= SPEC_MIN)
 
 if (nrow(signals_from_tweets) == 0) {
@@ -347,7 +341,7 @@ if (nrow(signals_from_tweets) == 0) {
   quit(status = 0)
 }
 
-# Deduplicate & prioritize better-scored signals
+# Deduplicate & prioritise
 signals_from_tweets <- signals_from_tweets %>%
   mutate(
     conversation_id = as.character(conversation_id),
@@ -367,8 +361,6 @@ signals_from_tweets <- signals_from_tweets %>%
   ) %>%
   distinct(conversation_id, ticker, created_et, .keep_all = TRUE)
 
-# -------------------------- Prepare & upsert --------------------
-
 signals_db <- signals_from_tweets %>%
   mutate(
     tweet_key = paste0(conversation_id, "_", ticker, "_", format(created_et, "%Y%m%d%H%M%S")),
@@ -378,65 +370,79 @@ signals_db <- signals_from_tweets %>%
     text      = as.character(text)
   ) %>%
   transmute(
-    tweet_key,
-    username,
-    conversation_id,
-    created_et,
-    text,
-    ticker,
-    conviction,
-    direction,
-    horizon,
-    stop_loss_pct,
-    buy_zone,
-    sentiment_score,
-    rationale,
-    specificity_score,
-    has_quant_data,
-    evidence_score,
-    evidence_types,
-    evidence_snippet
-  )
-
-tmp_name <- "tmp_tweet_signals"
-dbWriteTable(con, tmp_name, signals_db, temporary = TRUE, overwrite = TRUE)
-
-invisible(dbExecute(con, sprintf("
-  INSERT INTO tweet_signals AS t (
     tweet_key, username, conversation_id, created_et, text, ticker,
     conviction, direction, horizon, stop_loss_pct, buy_zone,
     sentiment_score, rationale, specificity_score, has_quant_data,
     evidence_score, evidence_types, evidence_snippet
   )
-  SELECT
-    tweet_key, username, conversation_id, created_et, text, ticker,
-    conviction, direction, horizon, stop_loss_pct, buy_zone,
-    sentiment_score, rationale, specificity_score, has_quant_data,
-    evidence_score, evidence_types, evidence_snippet
-  FROM %s
-  ON CONFLICT (tweet_key) DO UPDATE SET
-    username          = EXCLUDED.username,
-    conversation_id   = EXCLUDED.conversation_id,
-    created_et        = EXCLUDED.created_et,
-    text              = EXCLUDED.text,
-    ticker            = EXCLUDED.ticker,
-    conviction        = EXCLUDED.conviction,
-    direction         = EXCLUDED.direction,
-    horizon           = EXCLUDED.horizon,
-    stop_loss_pct     = EXCLUDED.stop_loss_pct,
-    buy_zone          = EXCLUDED.buy_zone,
-    sentiment_score   = EXCLUDED.sentiment_score,
-    rationale         = EXCLUDED.rationale,
-    specificity_score = EXCLUDED.specificity_score,
-    has_quant_data    = EXCLUDED.has_quant_data,
-    evidence_score    = EXCLUDED.evidence_score,
-    evidence_types    = EXCLUDED.evidence_types,
-    evidence_snippet  = EXCLUDED.evidence_snippet;
-", DBI::dbQuoteIdentifier(con, tmp_name))))
 
-invisible(dbExecute(con, sprintf("DROP TABLE IF EXISTS %s;", DBI::dbQuoteIdentifier(con, tmp_name))))
+# -------------------------- Upsert with reconnect/retry ---------
+upsert_signals <- function(df) {
+  # small helper to do the whole write in one connection
+  do_write <- function(con, df) {
+    # (optional) make long statements less likely to time out
+    invisible(dbExecute(con, "SET statement_timeout = '180s';"))
+
+    tmp_name <- paste0("tmp_tweet_signals_", as.integer(Sys.time()))
+    dbWriteTable(con, tmp_name, df, temporary = TRUE, overwrite = TRUE)
+
+    invisible(dbExecute(con, sprintf("
+      INSERT INTO tweet_signals AS t (
+        tweet_key, username, conversation_id, created_et, text, ticker,
+        conviction, direction, horizon, stop_loss_pct, buy_zone,
+        sentiment_score, rationale, specificity_score, has_quant_data,
+        evidence_score, evidence_types, evidence_snippet
+      )
+      SELECT
+        tweet_key, username, conversation_id, created_et, text, ticker,
+        conviction, direction, horizon, stop_loss_pct, buy_zone,
+        sentiment_score, rationale, specificity_score, has_quant_data,
+        evidence_score, evidence_types, evidence_snippet
+      FROM %s
+      ON CONFLICT (tweet_key) DO UPDATE SET
+        username          = EXCLUDED.username,
+        conversation_id   = EXCLUDED.conversation_id,
+        created_et        = EXCLUDED.created_et,
+        text              = EXCLUDED.text,
+        ticker            = EXCLUDED.ticker,
+        conviction        = EXCLUDED.conviction,
+        direction         = EXCLUDED.direction,
+        horizon           = EXCLUDED.horizon,
+        stop_loss_pct     = EXCLUDED.stop_loss_pct,
+        buy_zone          = EXCLUDED.buy_zone,
+        sentiment_score   = EXCLUDED.sentiment_score,
+        rationale         = EXCLUDED.rationale,
+        specificity_score = EXCLUDED.specificity_score,
+        has_quant_data    = EXCLUDED.has_quant_data,
+        evidence_score    = EXCLUDED.evidence_score,
+        evidence_types    = EXCLUDED.evidence_types,
+        evidence_snippet  = EXCLUDED.evidence_snippet;
+    ", DBI::dbQuoteIdentifier(con, tmp_name))))
+
+    invisible(dbExecute(con, sprintf("DROP TABLE IF EXISTS %s;", DBI::dbQuoteIdentifier(con, tmp_name))))
+  }
+
+  # one retry with a fresh connection if we see an EOF/SSL-type error
+  for (attempt in 1:2) {
+    con <- open_con()
+    ok <- tryCatch({
+      do_write(con, df)
+      TRUE
+    }, error = function(e) {
+      msg <- conditionMessage(e)
+      message(sprintf("Upsert attempt %d failed: %s", attempt, msg))
+      FALSE
+    }, finally = {
+      try(dbDisconnect(con), silent = TRUE)
+    })
+
+    if (ok) return(invisible(TRUE))
+    Sys.sleep(2^attempt)
+  }
+  stop("Upsert failed after retry.")
+}
+
+upsert_signals(signals_db)
 
 message(sprintf("✅ Upserted %d signals from the last %d hours.", nrow(signals_db), TIME_WINDOW_HOURS))
-
-
 
