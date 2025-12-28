@@ -1,4 +1,4 @@
-#!/usr/bin/env Rscript
+######!/usr/bin/env Rscript
 
 # ================================================================
 # Generate trade signals for the last N hours of twitter_threads
@@ -446,6 +446,7 @@ upsert_signals <- function(df) {
 upsert_signals(signals_db)
 
 message(sprintf("✅ Upserted %d signals from the last %d hours.", nrow(signals_db), TIME_WINDOW_HOURS))
+
 
 
 
