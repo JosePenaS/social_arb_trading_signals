@@ -1,21 +1,15 @@
-name: Generate Tweet Signals
+name: Generate Tweet Signals → Supabase
 
 on:
-  # Run twice per day (≈9:00 AM & 3:30 PM New York)
   schedule:
-    - cron: '0 13 * * *'
-    - cron: '30 19 * * *'
-  # Allow manual runs
-  workflow_dispatch: {}
-
-concurrency:
-  group: tweet-signals
-  cancel-in-progress: false
+    # GitHub cron is UTC. Pick times you want it to run.
+    - cron: '0 14 * * *'
+    - cron: '30 21 * * *'
+  workflow_dispatch:
 
 jobs:
-  generate:
+  generate_signals:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
@@ -24,41 +18,50 @@ jobs:
         with:
           r-version: '4.3'
 
-      - name: Install system dependencies
+      - name: Install system deps
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential libpq-dev libssl-dev \
             libcurl4-openssl-dev libxml2-dev
 
-      - name: Install R packages
-        run: |
-          Rscript -e 'install.packages(c(
-            "dplyr","purrr","stringr","lubridate","jsonlite",
-            "glue","httr","DBI","RPostgres","tidyr"
-          ), repos="https://cloud.r-project.org")'
+      - uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::DBI
+            any::RPostgres
+            any::dplyr
+            any::purrr
+            any::tibble
+            any::stringr
+            any::lubridate
+            any::tidyr
+            any::glue
+            any::jsonlite
+            any::httr2
 
       - name: Run generate_tweet_signals.R
         env:
-          # ---- Supabase ----
-          SUPABASE_HOST:   ${{ secrets.SUPABASE_HOST }}
-          SUPABASE_PORT:   ${{ secrets.SUPABASE_PORT }}
-          SUPABASE_DB:     ${{ secrets.SUPABASE_DB }}
-          SUPABASE_USER:   ${{ secrets.SUPABASE_USER }}
-          SUPABASE_PWD:    ${{ secrets.SUPABASE_PWD }}
+          # OpenAI
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
-          # ---- OpenAI ----
-          OPENAI_API_KEY:  ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL:    ${{ vars.OPENAI_MODEL || 'gpt-4o' }}
+          # Supabase
+          SUPABASE_PORT: ${{ secrets.SUPABASE_PORT }}
+          SUPABASE_DB:   ${{ secrets.SUPABASE_DB }}
+          SUPABASE_USER: ${{ secrets.SUPABASE_USER }}
+          SUPABASE_PWD:  ${{ secrets.SUPABASE_PWD }}
 
-          # ---- Controls (24h window version) ----
-          TIME_WINDOW_HOURS: ${{ vars.TIME_WINDOW_HOURS || '24' }}
-          SPEC_MIN:          ${{ vars.SPEC_MIN || '0.30' }}
+          # Pooler host (can be a repo variable)
+          SUPABASE_POOLER_HOST: ${{ vars.SUPABASE_POOLER_HOST }}
 
-          # Kept for compatibility if you switch back to unseen-threads mode
-          BATCH_LIMIT:     ${{ vars.BATCH_LIMIT || '150' }}
+          # Optional tuning (repo variables)
+          LOCAL_TZ: ${{ vars.LOCAL_TZ }}
+          SIGNALS_LOOKBACK_MINUTES: ${{ vars.SIGNALS_LOOKBACK_MINUTES }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
+          OPENAI_TEMPERATURE: ${{ vars.OPENAI_TEMPERATURE }}
+          OPENAI_MAX_TOKENS: ${{ vars.OPENAI_MAX_TOKENS }}
+
         run: |
           Rscript generate_tweet_signals.R
-          # If your script lives in scripts/, use:
-          # Rscript scripts/generate_tweet_signals.R
+
 
